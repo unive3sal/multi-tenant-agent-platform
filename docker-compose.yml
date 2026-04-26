@@ -21,7 +21,7 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/platform
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/platform?sslmode=disable
       BIND_ADDR: 0.0.0.0:3000
       RUST_LOG: info,sqlx=warn
       GLOBAL_MAX_CONCURRENCY: 32

@@ -15,6 +15,33 @@ The platform lets tenants register mock tools, create agents bound to explicit t
 - `architecture_decision_record.md` — architecture decisions for tenant isolation, async execution, and traces
 - `demo_tenant_isolation.sh` — end-to-end tenant isolation demo script
 
+## Architecture overview
+
+```text
+┌──────────────┐       HTTP        ┌────────────────────────────────────┐
+│  demo CLI    │ ────────────────▶ │ platform server (Axum + Tokio)    │
+│ external API │                   │                                    │
+└──────────────┘                   │  routes/http ─▶ db/runtime/trace   │
+        ▲                          │       │              │             │
+        │                          │       ▼              ▼             │
+        │                          │  auth/API keys   scheduler         │
+        │                          │  tenant context  mock agent loop   │
+        │                          └──────────┬───────────┬─────────────┘
+        │                                     │           │
+        │                  shared DTOs        ▼           ▼
+        └────────────── crates/platform-core  PostgreSQL  run_traces
+```
+
+The repository is split into a deployable platform server, an external demo client, and a small shared core crate. The `server` binary owns HTTP routing, authentication, persistence, scheduling, runtime execution, and trace recording. The `demo` binary is intentionally kept as an outside client boundary: it exercises tenant, API-key, tool, agent, run, and trace workflows only through public HTTP APIs. `platform-core` contains shared DTOs and domain types so the server and demo agree on request and response shapes without coupling the demo to server internals.
+
+The server follows a thin-handler architecture. `server/src/main.rs` loads configuration, connects to PostgreSQL, optionally runs migrations, builds shared state, and starts Axum. `server/src/app.rs` wires routes and scheduler state. `server/src/http.rs` authenticates requests, performs request-shape validation, delegates business behavior to the database/runtime layers, and maps results into API responses.
+
+Tenant isolation is the primary system invariant. API keys authenticate into a tenant context, tenant-owned database operations receive an explicit `tenant_id`, and tenant identity comes from the bearer token rather than request bodies. The schema uses shared tables with `tenant_id` plus composite foreign keys to keep tools, agents, runs, and trace rows tenant-consistent.
+
+Agent runs are persisted before scheduling. The runtime uses global and per-tenant concurrency semaphores, fast-fails runs when capacity is unavailable, and only starts execution after the database transitions a run from `pending` to `running`. The mock agent loop is deterministic for repeatable demos and tests: it calls bound tools until enough tool results exist, then produces a final answer.
+
+Execution observability is exposed through ordered traces stored in `run_traces`. Trace writes are centralized, sequence numbers are monotonic per run, and user-visible events include run creation, scheduling decisions, runtime start, LLM calls, tool execution, and run completion.
+
 ## Requirements
 
 - Rust toolchain

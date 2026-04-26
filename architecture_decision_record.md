@@ -1,71 +1,360 @@
-# Architecture Decision Record: Multi-Tenant Agent Platform
+# Architecture Decision Record
 
-## Decision 1: Enforce tenant isolation through tenant-scoped resources and server-derived identity
+## ADR-001: Tenant Isolation, Agent Loop Scheduling, and Observability
 
-### Context
+## Status
 
-The platform allows multiple tenants to register tools, create agents, start agent runs, and inspect execution traces. The core risk is accidental or malicious cross-tenant access: a tenant must not be able to read another tenant's agents, bind another tenant's tools, execute another tenant's resources, or inspect another tenant's traces.
+Proposed
 
-Client-provided tenant identifiers cannot be trusted for tenant-owned operations. Tenant identity must be derived from authentication, and the same tenant boundary must be enforced consistently during CRUD operations, agent configuration, runtime tool execution, idempotency handling, and trace lookup.
+## Context
 
-### Tradeoff
+This project implements a multi-tenant agent platform. The platform is responsible for creating agents, running agent loops, exposing tenant-specific tools, and allowing tenants to query task execution traces.
 
-One option is to use globally unique resource IDs only and check ownership in application code. This keeps the schema simple, but it makes isolation dependent on every query being written correctly.
+The core architectural concern is tenant isolation. A tenant must only be able to access its own resources throughout the full lifecycle of agent usage.
 
-Another option is to make `tenant_id` part of every tenant-owned resource and use composite uniqueness and foreign keys such as `(tenant_id, agent_id)` and `(tenant_id, tool_id)`. This adds some schema verbosity, but it makes cross-tenant joins and invalid bindings harder to express accidentally.
+Tenant isolation must cover at least the following areas:
 
-A stricter production option would be PostgreSQL Row-Level Security. That would provide stronger database-level isolation, but it adds operational complexity and is unnecessary for this local take-home implementation.
+- Data isolation
+- Tool schema isolation
+- Agent loop lifecycle isolation
+- Task context isolation
+- Trace lookup isolation
+- Idempotency isolation
 
-### Decision
+The platform should not trust tenant identity directly provided by the client. All access to tenant-owned resources must be authenticated and resolved through an API key.
 
-Use application-level authentication plus tenant-scoped database modeling. API keys are stored as hashes, and the server derives the tenant from the bearer token rather than trusting request bodies. Tenant-owned tables include `tenant_id`, and relationships such as agent-tool bindings, runs, and traces are constrained by tenant-aware foreign keys.
+## Decision
 
-This decision keeps the implementation explainable and lightweight while still making tenant isolation explicit in the data model, service layer, and runtime agent loop. It also supports per-tenant idempotency by scoping `Idempotency-Key` uniqueness to `(tenant_id, agent_id, idempotency_key)`.
+### 1. Use a Global Tenant ID as the Isolation Boundary
 
----
+Each tenant has a globally unique `tenant_id`.
 
-## Decision 2: Execute agent runs asynchronously with bounded concurrency and explicit run state transitions
+All tenant-owned resources must include a `tenant_id` field, including but not limited to:
 
-### Context
+- Agents
+- Tools
+- Runs
+- Tasks
+- Trace events
+- Idempotency records
 
-Starting an agent run should not require the client to drive the loop step by step. After `POST /agents/{id}/run`, the platform is responsible for running the loop asynchronously: call the mock LLM, execute allowed tools, append tool results, stop on `final_answer`, and fail on `max_iterations`.
+The `tenant_id` is the primary logical boundary for resource ownership.
 
-However, asynchronous execution introduces concurrency risks. Multiple tenants may submit runs at the same time, one tenant could consume all runtime capacity, and the same run must not be executed twice because of retries or duplicate requests.
+### 2. Resolve Tenant Identity from API Key
 
-### Tradeoff
+The client must not provide `tenant_id` as a trusted input.
 
-One option is to execute the full agent loop synchronously inside the HTTP request. This is simple, but it ties client latency to the whole run and makes timeout behavior worse.
+Instead, the platform resolves the tenant identity from the API key attached to the request.
 
-Another option is to use a durable external queue such as Redis, Kafka, or a managed job system. That would improve reliability and recovery, but it is too heavy for a four-hour local take-home project.
+The resolved `tenant_id` is then used by the platform to:
 
-A middle-ground option is an in-process Tokio-based scheduler with bounded global concurrency, per-tenant concurrency limits, and database-backed run states. This is less durable than an external queue, but it is simple, local, and enough to demonstrate scheduling, fairness, and isolation.
+- Filter resource queries
+- Validate resource ownership
+- Create new tenant-owned resources
+- Select visible tool schemas
+- Scope idempotency keys
+- Scope trace lookup
 
-### Decision
+### 3. Enforce Tenant Checks in CRUD, Configuration, and Runtime
 
-Use an in-process asynchronous scheduler. A run is persisted first with status `pending`, then the scheduler attempts to acquire global and per-tenant capacity before transitioning it to `running`. If capacity is unavailable, the platform can fail fast rather than maintaining an unbounded queue.
+Tenant ownership must be checked in all major platform operations:
 
-Run state transitions are explicit: `pending -> running -> success` or `pending/running -> failed`. Each run has its own message context, retry metadata, timestamps, and trace sequence. `max_iterations` is enforced by the runtime to prevent infinite loops. This design keeps the agent loop non-blocking for clients while limiting resource contention and making duplicate execution easier to prevent.
+- CRUD operations
+- Agent configuration access
+- Agent loop scheduling
+- Tool schema exposure
+- Tool execution
+- Trace lookup
+- Idempotency handling
 
----
+This means tenant isolation is not only a database concern. It must also be enforced at the application logic layer.
 
-## Decision 3: Separate tenant-facing execution traces from platform logs and aggregate metrics
+### 4. Isolate Agent Loop Lifecycle per Tenant
 
-### Context
+The platform manages the full lifecycle of each agent run.
 
-The platform needs observability for two different audiences. Tenants need a business-level trace of their own agent runs so they can understand what happened: LLM call, tool execution, final answer, or failure reason. The platform operator also needs implementation-level logs and aggregate metrics for debugging, capacity planning, and alerting.
+Clients should not manually drive the agent loop step by step. Instead, the client submits a task or run request, and the platform owns the execution lifecycle.
 
-These concerns should not be mixed. Tenant-facing traces must be scoped by tenant and safe to expose through the public API. Platform logs may contain operational details and should not become part of the tenant API contract.
+Each run or task belongs to exactly one tenant.
 
-### Tradeoff
+A task from one tenant must not be able to:
 
-One option is to rely only on platform logs. This is easy to implement, but logs are hard for tenants to query safely and do not provide a stable API-level view of a run.
+- Access another tenant's agent
+- Use another tenant's tools
+- Read another tenant's trace
+- Share mutable runtime context with another tenant's task
 
-Another option is to store every low-level internal event in the database. That provides maximum detail, but it can expose unnecessary internals and increase schema complexity.
+Tasks from the same tenant should still have isolated runtime contexts, but they may share read-only tenant-owned resources when appropriate.
 
-A balanced option is to persist a compact, ordered business trace per run, while keeping platform logs and metrics separate. The trace table records stable event types such as `llm_call`, `tool_exec`, and `run_end`, with a monotonic sequence number and JSON payload.
+### 5. Scope Tool Schema by Tenant
 
-### Decision
+The tools exposed to the LLM must be filtered by tenant.
 
-Persist tenant-scoped run traces as first-class data. Each trace event belongs to `(tenant_id, run_id)`, has a unique sequence number, and is returned only after API-key authentication confirms the caller belongs to the same tenant.
+A tenant should only see tool schemas that belong to that tenant or are explicitly allowed for that tenant.
 
-Use platform logs for internal troubleshooting and aggregate metrics for monitoring scheduler behavior, run outcomes, latency, and failure counts. This keeps tenant-visible observability simple and safe while leaving room to add production-grade monitoring later without changing the public trace API.
+This prevents the LLM from being given tool definitions that the current tenant should not know about or invoke.
+
+### 6. Scope Trace Lookup by Tenant
+
+Trace events are tenant-owned resources.
+
+Trace lookup must be authenticated by API key and filtered by the resolved `tenant_id`.
+
+A tenant can only query trace events belonging to its own runs and tasks.
+
+Business trace data should be treated as private tenant data.
+
+### 7. Scope Idempotency Key by Tenant
+
+`Idempotency-Key` must be scoped per tenant.
+
+The same idempotency key value from different tenants should not conflict.
+
+The logical uniqueness should be based on a pair similar to:
+
+```text
+(tenant_id, idempotency_key)
+```
+
+This prevents one tenant's request idempotency record from affecting another tenant's request.
+
+## Agent Loop Scheduling
+
+## Context
+
+The platform should support asynchronous agent execution.
+
+Running an agent loop may involve multiple steps, including model calls, tool calls, trace generation, state transitions, retries, and final result persistence.
+
+If the platform directly executes all tasks without control, one tenant may consume too many resources and affect other tenants.
+
+Therefore, the agent loop needs a scheduling mechanism.
+
+## Decision
+
+### 1. Use a Task Pool for Agent Runs
+
+The platform uses a task pool to schedule agent loop execution.
+
+The task pool behaves similarly to a thread pool:
+
+- When capacity is available, a task can be scheduled.
+- When the pool is full, the platform may fail fast.
+- The platform does not need to provide a complex queue in the demo version.
+
+### 2. Use Two-Level Concurrency Limits
+
+The platform applies two levels of concurrency control:
+
+- Global maximum concurrency
+- Per-tenant maximum concurrency
+
+The global limit protects the whole platform.
+
+The per-tenant limit prevents a single tenant from consuming all execution resources.
+
+Example configuration:
+
+```text
+GLOBAL_MAX_CONCURRENCY = 32
+PER_TENANT_MAX_CONCURRENCY = 8
+```
+
+### 3. Use Task State Machine to Prevent Duplicate Execution
+
+Each task should have a clear lifecycle state.
+
+Example states:
+
+```text
+pending -> running -> succeeded
+pending -> running -> failed
+pending -> running -> retrying -> running
+```
+
+The state machine prevents the same task from being executed repeatedly by mistake.
+
+### 4. Support Retry with a Maximum Retry Count
+
+Each task may have a `max_retry` value.
+
+The default value can be:
+
+```text
+max_retry = 3
+```
+
+Retries are used to handle temporary failures, such as transient tool errors or model call failures.
+
+Retry should not violate idempotency or tenant isolation.
+
+## Observability
+
+## Context
+
+Observability has two different audiences:
+
+1. Tenant-facing observability
+2. Platform-facing observability
+
+Tenant-facing observability allows tenants to inspect their own business execution data.
+
+Platform-facing observability helps the platform operator understand system health and stability.
+
+These two types of observability should be separated.
+
+## Decision
+
+### 1. Provide Tenant-Facing Business Trace
+
+The platform records business trace events for each task or run.
+
+A tenant can query its own trace data to understand:
+
+- Agent execution steps
+- Tool calls
+- Model call results
+- Errors
+- Retry behavior
+- Final task result
+
+Trace records should include `tenant_id`.
+
+Trace lookup must be authenticated and filtered by tenant.
+
+### 2. Use JSON Payload for Trace Events
+
+Business trace events can use a JSON payload.
+
+This keeps the trace format flexible and easy to extend in the demo version.
+
+Example trace event shape:
+
+```json
+{
+  "tenant_id": "tenant_123",
+  "task_id": "task_456",
+  "event_type": "tool_call_started",
+  "payload": {
+    "tool_name": "search_docs",
+    "input": {
+      "query": "example"
+    }
+  }
+}
+```
+
+### 3. Keep Platform Logs and Metrics Separate
+
+The platform may also produce internal logs and metrics.
+
+Platform logs and metrics are used for:
+
+- Debugging
+- Monitoring
+- Alerting
+- Capacity analysis
+- Error diagnosis
+
+They are not the same as tenant-facing business traces.
+
+In the demo version, platform-side metrics and tracing can remain simple.
+
+## Trade-offs
+
+### Benefits
+
+This design provides a clear and consistent tenant isolation model.
+
+The main benefits are:
+
+- Tenant-owned resources are easy to identify through `tenant_id`.
+- Access control is enforced consistently through API-key-based tenant resolution.
+- CRUD, runtime execution, tool exposure, and trace lookup share the same isolation boundary.
+- Per-tenant concurrency limits reduce the risk of one tenant monopolizing platform resources.
+- Business traces are treated as tenant-owned private data.
+
+### Costs
+
+This design requires every tenant-owned resource and query path to handle `tenant_id` carefully.
+
+The implementation must avoid mistakes such as:
+
+- Creating tenant-owned resources without `tenant_id`
+- Querying resources without tenant filtering
+- Trusting client-provided tenant identity
+- Exposing all tool schemas to every tenant
+- Looking up traces only by `task_id` without checking tenant ownership
+
+### Boundary
+
+This ADR does not solve all possible production-grade multi-tenant platform problems.
+
+The current design does not fully address:
+
+- Cross-region tenant placement
+- Multi-database tenant sharding
+- Resource redundancy
+- Dynamic resource overbooking
+- SLA-based scheduling
+- API key revocation after leakage
+- Fine-grained role-based access control within the same tenant
+- Strong database-level isolation such as PostgreSQL Row-Level Security
+
+These topics can be addressed in future ADRs if the platform evolves beyond the demo scope.
+
+## Alternatives Considered
+
+### 1. Trust Client-Provided Tenant ID
+
+The platform could allow the client to send `tenant_id` directly in each request.
+
+This option is rejected.
+
+Reason:
+
+- The client-provided tenant ID cannot be trusted.
+- A malicious or buggy client could access another tenant's resources by changing the tenant ID.
+- It makes authorization logic fragile.
+
+### 2. No Per-Tenant Concurrency Limit
+
+The platform could only use a global concurrency limit.
+
+This option is rejected for the current design.
+
+Reason:
+
+- A single tenant could consume all available execution capacity.
+- Other tenants could be starved.
+- The platform would have weaker fairness guarantees.
+
+### 3. Fully Dynamic Resource Overbooking
+
+The platform could dynamically overbook resources and allocate idle capacity to high-traffic tenants.
+
+This option is not selected for the demo version.
+
+Reason:
+
+- It adds scheduling complexity.
+- It requires better metrics and capacity planning.
+- It is more suitable for a production-grade platform with SLA requirements.
+
+The demo version uses simpler global and per-tenant limits.
+
+## Consequences
+
+The implementation should ensure that tenant isolation is visible in the code structure.
+
+Important implementation expectations:
+
+- Request authentication resolves `tenant_id` from API key.
+- Repository/database queries include tenant filters.
+- Task scheduling checks both global and per-tenant concurrency limits.
+- Tool schemas are selected based on tenant ownership.
+- Trace lookup requires tenant ownership validation.
+- Idempotency keys are unique per tenant.
+- Runtime task context is isolated per task.
+
+This keeps the platform simple enough for a demo while still demonstrating the most important multi-tenant platform design principles.

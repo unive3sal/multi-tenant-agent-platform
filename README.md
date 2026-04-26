@@ -12,6 +12,8 @@ The platform lets tenants register mock tools, create agents bound to explicit t
 - `server/migrations/` — PostgreSQL schema migrations
 - `demo/examples/` — example tool schema and mock handler JSON
 - `spec/` — server and demo client specifications
+- `architecture_decision_record.md` — architecture decisions for tenant isolation, async execution, and traces
+- `demo_tenant_isolation.sh` — end-to-end tenant isolation demo script
 
 ## Requirements
 
@@ -330,6 +332,20 @@ Manual checks:
 - Register tools separately under each tenant's API key.
 - Try to create a Tenant A agent with a Tenant B tool ID; the request should fail.
 - Try to read a Tenant A run or trace with Tenant B's API key; the request should fail.
+
+## Tenant isolation demo script
+
+`demo_tenant_isolation.sh` runs an end-to-end isolation walkthrough against a running platform server. It creates two tenants, registers separate tools and agents, starts runs for each tenant, prints their traces, and verifies that cross-tenant trace reads fail.
+
+```bash
+./demo_tenant_isolation.sh
+```
+
+To target a different server URL, pass it as the first argument or set `BASE_URL`:
+
+```bash
+BASE_URL=http://127.0.0.1:3000 ./demo_tenant_isolation.sh
+```
 
 ## Notes
 

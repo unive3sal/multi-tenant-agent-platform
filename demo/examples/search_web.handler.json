@@ -1,0 +1,6 @@
+{
+  "type": "static",
+  "response": {
+    "result": "mock search result"
+  }
+}
